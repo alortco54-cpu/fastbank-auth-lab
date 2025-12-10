@@ -1,108 +1,119 @@
 const express = require("express");
 const bodyParser = require("body-parser");
 const cookieParser = require("cookie-parser");
-const crypto = require("crypto");
-// bcrypt is installed but NOT used in the vulnerable baseline:
 const bcrypt = require("bcrypt");
+const crypto = require("crypto");
 
 const app = express();
 const PORT = 3001;
 
-app.use(bodyParser.urlencoded({ extended: false }));
+// Middleware
 app.use(bodyParser.json());
+app.use(bodyParser.urlencoded({ extended: false }));
 app.use(cookieParser());
 app.use(express.static("public"));
 
-/**
- * VULNERABLE FAKE USER DB
- * For simplicity, we start with a single user whose password is "password123".
- * In the vulnerable version, we hash with a fast hash (SHA-256-like).
- */
+// -----------------------------------------------------------------------------
+// USER DATABASE (bcrypt-secured)
+// -----------------------------------------------------------------------------
 const users = [
   {
     id: 1,
     username: "student",
-    // VULNERABLE: fast hash without salt
-    passwordHash: fastHash("password123") // students must replace this scheme with bcrypt
+    passwordHash: bcrypt.hashSync("password123", 10) // bcrypt salted hash
   }
 ];
 
-// In-memory session store
-const sessions = {}; // token -> { userId }
+// -----------------------------------------------------------------------------
+// SESSION STORE
+// -----------------------------------------------------------------------------
+const sessions = {}; // token -> { userId, expiresAt }
 
-/**
- * VULNERABLE FAST HASH FUNCTION
- * Students MUST STOP using this and replace logic with bcrypt.
- */
-function fastHash(password) {
-  return crypto.createHash("sha256").update(password).digest("hex");
+// Create a strong, unpredictable session token
+function createSessionToken() {
+  return crypto.randomBytes(32).toString("hex");
 }
 
-// Helper: find user by username
-function findUser(username) {
-  return users.find((u) => u.username === username);
-}
-
-// Home API just to show who is logged in
-app.get("/api/me", (req, res) => {
+// Retrieve and validate a session from the request
+function loadSession(req) {
   const token = req.cookies.session;
-  if (!token || !sessions[token]) {
+  if (!token) return null;
+
+  const session = sessions[token];
+  if (!session) return null;
+
+  // Expired -> remove it
+  if (Date.now() >= session.expiresAt) {
+    delete sessions[token];
+    return null;
+  }
+
+  return session;
+}
+
+// -----------------------------------------------------------------------------
+// AUTHENTICATION ENDPOINTS
+// -----------------------------------------------------------------------------
+
+// Returns info about the currently authenticated user
+app.get("/api/me", (req, res) => {
+  const session = loadSession(req);
+  if (!session) {
     return res.status(401).json({ authenticated: false });
   }
-  const session = sessions[token];
+
   const user = users.find((u) => u.id === session.userId);
-  res.json({ authenticated: true, username: user.username });
+  return res.json({ authenticated: true, username: user.username });
 });
 
-/**
- * VULNERABLE LOGIN ENDPOINT
- * - Uses fastHash instead of bcrypt
- * - Error messages leak whether username exists
- * - Session token is simple and predictable
- * - Cookie lacks security flags
- */
-app.post("/api/login", (req, res) => {
+// Login endpoint (secure)
+app.post("/api/login", async (req, res) => {
   const { username, password } = req.body;
-  const user = findUser(username);
 
-  if (!user) {
-    // VULNERABLE: username enumeration via message
-    return res
-      .status(401)
-      .json({ success: false, message: "Unknown username" });
+  // Find user without leaking which part is incorrect
+  const account = users.find((u) => u.username === username);
+  if (!account) {
+    return res.status(401).json({ success: false, message: "Invalid credentials" });
   }
 
-  const candidateHash = fastHash(password);
-  if (candidateHash !== user.passwordHash) {
-    return res
-      .status(401)
-      .json({ success: false, message: "Wrong password" });
+  // Validate password using bcrypt
+  const passwordsMatch = await bcrypt.compare(password, account.passwordHash);
+  if (!passwordsMatch) {
+    return res.status(401).json({ success: false, message: "Invalid credentials" });
   }
 
-  // VULNERABLE: predictable token
-  const token = username + "-" + Date.now();
+  // Create session + expiration
+  const token = createSessionToken();
+  sessions[token] = {
+    userId: account.id,
+    expiresAt: Date.now() + 30 * 60 * 1000 // 30 minutes
+  };
 
-  // VULNERABLE: session stored without expiration
-  sessions[token] = { userId: user.id };
-
-  // VULNERABLE: cookie without httpOnly, secure, sameSite
+  // Secure cookie
   res.cookie("session", token, {
-    // students must add: httpOnly: true, secure: true, sameSite: "lax"
+    httpOnly: true,
+    secure: true,
+    sameSite: "lax",
+    maxAge: 30 * 60 * 1000
   });
 
-  // Client-side JS (login.html) will store this token in localStorage (vulnerable)
-  res.json({ success: true, token });
+  return res.json({ success: true });
 });
 
+// Logout endpoint
 app.post("/api/logout", (req, res) => {
   const token = req.cookies.session;
-  if (token && sessions[token]) {
+  if (token) {
     delete sessions[token];
   }
+
   res.clearCookie("session");
-  res.json({ success: true });
+  return res.json({ success: true });
 });
 
+// -----------------------------------------------------------------------------
+// SERVER START
+// -----------------------------------------------------------------------------
 app.listen(PORT, () => {
-  console.log(`FastBank Auth Lab running at http://localhost:${PORT}`);
+  console.log(`FastBank Auth Lab (Hardened Version) running at http://localhost:${PORT}`);
 });
